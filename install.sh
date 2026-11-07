@@ -1051,42 +1051,49 @@ def cmd_telegram_setup(out_path):
         sys.exit("Telegram: токен не подошёл.")
 
     for _ in range(3):
-        chat = ask("Канал: @username или ссылка t.me/... (для закрытого канала просто Enter): ")
+        chat = ask("Канал или группа: @username или ссылка t.me/... (если закрытые, просто Enter): ")
         chat = re.sub(r"^(https?://)?(t\.me|telegram\.me)/", "", chat).strip().strip("/")
         if chat and not chat.startswith(("@", "-")):
             chat = "@" + chat
         if not chat:
-            say("  Опубликуйте любое сообщение в канале (бот должен быть админом). Жду до 3 минут...")
+            say("  Опубликуйте любое сообщение в канале или группе (бот должен быть админом). Жду до 3 минут...")
             offset, deadline = None, time.time() + 180
             while not chat and time.time() < deadline:
-                params = {"timeout": 25, "allowed_updates": ["channel_post", "my_chat_member"]}
+                params = {"timeout": 25,
+                          "allowed_updates": ["channel_post", "my_chat_member", "message"]}
                 if offset is not None:
                     params["offset"] = offset
                 res = tg_call(token, "getUpdates", params, timeout=35)
                 for u in res.get("result", []):
                     offset = u["update_id"] + 1
-                    c = (u.get("channel_post") or u.get("my_chat_member") or {}).get("chat") or {}
-                    if c.get("type") == "channel":
+                    src = u.get("channel_post") or u.get("my_chat_member") or u.get("message") or {}
+                    c = src.get("chat") or {}
+                    if c.get("type") in ("channel", "group", "supergroup"):
                         chat = str(c["id"])
-                        say("  Нашёл канал: %s" % c.get("title", chat))
+                        kind = "канал" if c["type"] == "channel" else "группу"
+                        say("  Нашёл %s: %s" % (kind, c.get("title", chat)))
                         break
                 if not res.get("ok"):
                     say("  getUpdates: %s" % res.get("description"))
                     break
             if not chat:
-                say("  Не дождался сообщения в канале.")
+                say("  Не дождался сообщения в канале или группе.")
                 continue
         res = tg_call(token, "sendMessage", {
             "chat_id": chat, "text": "✅ Сюда будут приходить заявки с сайта воркшопа AIRL."})
+        new_id = (res.get("parameters") or {}).get("migrate_to_chat_id")
+        if not res.get("ok") and new_id:  # group was upgraded to a supergroup: new id
+            res = tg_call(token, "sendMessage", {
+                "chat_id": new_id, "text": "✅ Сюда будут приходить заявки с сайта воркшопа AIRL."})
         if res.get("ok"):
             chat_id = str(res["result"]["chat"]["id"])
-            say("  Тестовое сообщение отправлено в канал.")
+            say("  Тестовое сообщение отправлено, проверьте Telegram.")
             fd = os.open(out_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
             with os.fdopen(fd, "w") as f:
                 f.write("%s\n%s\n" % (token, chat_id))
             return
-        say("  Не получилось написать в канал: %s" % res.get("description"))
-        say("  Проверьте, что бот добавлен в канал администратором с правом публикации.")
+        say("  Не получилось написать: %s" % res.get("description"))
+        say("  Проверьте, что бот добавлен администратором (в канале: с правом публикации).")
     sys.exit("Telegram: канал не настроен.")
 
 
