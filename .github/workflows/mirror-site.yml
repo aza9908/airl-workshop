@@ -1,0 +1,41 @@
+name: Copy live page into site/
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/mirror-site.yml
+      - app/sitetool.py
+
+permissions:
+  contents: write
+
+concurrency:
+  group: mirror-site
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download the page from airl-workshop.web.app
+        run: |
+          python3 app/sitetool.py mirror --source https://airl-workshop.web.app --out site.new
+          rm -rf site
+          mv site.new site
+          ls -R site | head -50
+
+      - name: Commit changes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A site
+          if git diff --cached --quiet; then
+            echo "site/ is already up to date"
+          else
+            git commit -m "Update site/ from https://airl-workshop.web.app"
+            git push
+          fi
