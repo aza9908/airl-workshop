@@ -211,6 +211,42 @@ def build(mirror_dir, out, base_url, source, whatsapp=None):
     with open(index, "w", encoding="utf-8") as f:
         f.write(text)
 
+    # Changed code files get a new name with a hash of their content
+    # (index-X.js -> index-X.<hash>.js) and every reference is updated. Assets
+    # are cached by browsers for a year, so a file whose content changed must
+    # never keep its old name, or visitors keep running the old copy.
+    renamed = {}
+    for rel in [r for r in patched if r.endswith((".js", ".mjs"))]:
+        p = os.path.join(out, rel)
+        with open(p, "rb") as f:
+            digest = hashlib.sha256(f.read()).hexdigest()[:8]
+        stem, ext = os.path.splitext(os.path.basename(rel))
+        new_name = "%s.%s%s" % (stem, digest, ext)
+        os.rename(p, os.path.join(os.path.dirname(p), new_name))
+        renamed[os.path.basename(rel)] = new_name
+    if renamed:
+        for dirpath, _, files in os.walk(out):
+            for name in files:
+                if not name.endswith((".html", ".js", ".mjs", ".css", ".webmanifest")):
+                    continue
+                p = os.path.join(dirpath, name)
+                with open(p, "r", encoding="utf-8", errors="surrogateescape") as f:
+                    text = f.read()
+                new_text = text
+                for old_name, new_name in renamed.items():
+                    new_text = re.sub(r"(?<=[/\"'`])" + re.escape(old_name) + r"(?=[\"'`?#)])",
+                                      new_name, new_text)
+                if new_text != text:
+                    with open(p, "w", encoding="utf-8", errors="surrogateescape") as f:
+                        f.write(new_text)
+        with open(index, "r", encoding="utf-8") as f:
+            index_text = f.read()
+        for new_name in renamed.values():
+            if new_name not in index_text:
+                sys.exit("ERROR: index.html does not reference %s after renaming" % new_name)
+        patched = [os.path.join(os.path.dirname(r), renamed.get(os.path.basename(r), os.path.basename(r)))
+                   for r in patched]
+
     if not os.path.exists(os.path.join(out, "404.html")):
         with open(os.path.join(out, "404.html"), "w", encoding="utf-8") as f:
             f.write(NOT_FOUND)
