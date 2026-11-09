@@ -20,6 +20,8 @@
 #   --no-whatsapp     turn that WhatsApp step off
 #   --telegram        connect a Telegram channel for leads (asks for the bot token here)
 #   --no-telegram     stop posting leads to Telegram
+#   --bitrix          create a Bitrix24 deal for each lead (asks for the webhook here)
+#   --no-bitrix       stop creating Bitrix24 deals
 #   --page-url URL    the page itself lives elsewhere (e.g. https://airl.kz/ai-for-work/workshop/):
 #                     visitors of this server are sent there; /api and /admin keep working here
 #   --serve-page      serve the page from this server again (undo --page-url)
@@ -39,6 +41,7 @@ FORWARD_FLAG=""
 WA_FLAG=""
 PAGE_FLAG=""
 TG_FLAG=""
+BX_FLAG=""
 
 ok()   { printf '\033[32m✓\033[0m %s\n' "$*"; }
 info() { printf '\033[36m→\033[0m %s\n' "$*"; }
@@ -60,6 +63,8 @@ while [ $# -gt 0 ]; do
     --no-whatsapp)  WA_FLAG="off"; shift ;;
     --telegram)     TG_FLAG=setup; shift ;;
     --no-telegram)  TG_FLAG=off; shift ;;
+    --bitrix)       BX_FLAG=setup; shift ;;
+    --no-bitrix)    BX_FLAG=off; shift ;;
     --page-url)     need_value "$1" "${2:-}"; PAGE_FLAG="$2"; shift 2 ;;
     --serve-page)   PAGE_FLAG=off; shift ;;
     -h|--help)      sed -n '2,29p' "$0"; exit 0 ;;
@@ -226,6 +231,23 @@ elif [ "$TG_FLAG" = setup ]; then
   rm -f "$TG_TMP"
 fi
 
+# ------------------------------------------------------------- Bitrix24 ----
+BX_URL="$(get_env BITRIX_WEBHOOK_URL)"
+BX_STAGE="$(get_env BITRIX_STAGE_ID)"
+if [ "$BX_FLAG" = off ]; then
+  BX_URL=""; BX_STAGE=""
+elif [ "$BX_FLAG" = setup ]; then
+  info "Connecting Bitrix24"
+  BX_TMP="$(mktemp)"
+  if "$PY" "$BASE/app/app.py" bitrix-setup "$BX_TMP"; then
+    BX_URL="$(sed -n 1p "$BX_TMP")"; BX_STAGE="$(sed -n 2p "$BX_TMP")"
+    ok "Bitrix24 connected"
+  else
+    warn "Bitrix24 was not connected; everything else continues. Run again with --bitrix to retry."
+  fi
+  rm -f "$BX_TMP"
+fi
+
 # --------------------------------------------------------- backend port ----
 # Other apps may already listen on local ports, so take the first free one.
 systemctl stop airl-workshop.service >/dev/null 2>&1 || true
@@ -247,7 +269,7 @@ ADMIN_USER="$(get_env ADMIN_USER)"; ADMIN_USER="${ADMIN_USER:-admin}"
 FWD_ENABLED="${FORWARD_FLAG:-$(get_env FORWARD_ENABLED)}"; FWD_ENABLED="${FWD_ENABLED:-1}"
 OTHER_LINES=""
 if [ -f "$ENV_FILE" ]; then
-  OTHER_LINES="$(grep -vE '^(#|$|ADMIN_USER=|ADMIN_PASSWORD=|FORWARD_URL=|FORWARD_ENABLED=|SITE_DOMAIN=|SITE_WHATSAPP=|SITE_PAGE_URL=|TELEGRAM_BOT_TOKEN=|TELEGRAM_CHAT_ID=|HOST=|PORT=|DATA_DIR=|BACKUP_DIR=)' "$ENV_FILE" || true)"
+  OTHER_LINES="$(grep -vE '^(#|$|ADMIN_USER=|ADMIN_PASSWORD=|FORWARD_URL=|FORWARD_ENABLED=|SITE_DOMAIN=|SITE_WHATSAPP=|SITE_PAGE_URL=|TELEGRAM_BOT_TOKEN=|TELEGRAM_CHAT_ID=|BITRIX_WEBHOOK_URL=|BITRIX_STAGE_ID=|HOST=|PORT=|DATA_DIR=|BACKUP_DIR=)' "$ENV_FILE" || true)"
 fi
 umask 077
 cat > "$ENV_FILE" <<EOF
@@ -260,6 +282,9 @@ FORWARD_URL=$FOUND_FORWARD
 # Telegram channel for leads (set up with: bash install.sh --telegram)
 TELEGRAM_BOT_TOKEN=$TG_TOKEN
 TELEGRAM_CHAT_ID=$TG_CHAT
+# Bitrix24 deals (set up with: bash install.sh --bitrix). The webhook URL is secret.
+BITRIX_WEBHOOK_URL=$BX_URL
+BITRIX_STAGE_ID=${BX_STAGE:-NEW}
 # Page settings
 SITE_DOMAIN=$DOMAIN
 SITE_WHATSAPP=$WA_NUM
@@ -709,6 +734,8 @@ echo "  Web server:      $WEB"
 echo "  Google Sheet:    copy of each lead $FWD_STATE"
 if [ -n "$TG_TOKEN" ] && [ -n "$TG_CHAT" ]; then TG_STATE="on (channel $TG_CHAT)"; else TG_STATE="off (connect with: bash install.sh --telegram)"; fi
 echo "  Telegram:        $TG_STATE"
+if [ -n "$BX_URL" ]; then BX_STATE="on (deals, stage ${BX_STAGE:-NEW})"; else BX_STATE="off (connect with: bash install.sh --bitrix)"; fi
+echo "  Bitrix24:        $BX_STATE"
 if [ -n "$WA_NUM" ]; then WA_STATE="after the form the page opens WhatsApp chat with +$WA_NUM"; else WA_STATE="off"; fi
 echo "  WhatsApp:        $WA_STATE"
 if [ -n "$PAGE_URL" ]; then echo "  Page:            $PAGE_URL (this server redirects there)"; fi

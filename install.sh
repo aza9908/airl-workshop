@@ -20,6 +20,8 @@
 #   --no-whatsapp     turn that WhatsApp step off
 #   --telegram        connect a Telegram channel for leads (asks for the bot token here)
 #   --no-telegram     stop posting leads to Telegram
+#   --bitrix          create a Bitrix24 deal for each lead (asks for the webhook here)
+#   --no-bitrix       stop creating Bitrix24 deals
 #   --page-url URL    the page itself lives elsewhere (e.g. https://airl.kz/ai-for-work/workshop/):
 #                     visitors of this server are sent there; /api and /admin keep working here
 #   --serve-page      serve the page from this server again (undo --page-url)
@@ -39,6 +41,7 @@ FORWARD_FLAG=""
 WA_FLAG=""
 PAGE_FLAG=""
 TG_FLAG=""
+BX_FLAG=""
 
 ok()   { printf '\033[32m✓\033[0m %s\n' "$*"; }
 info() { printf '\033[36m→\033[0m %s\n' "$*"; }
@@ -60,6 +63,8 @@ while [ $# -gt 0 ]; do
     --no-whatsapp)  WA_FLAG="off"; shift ;;
     --telegram)     TG_FLAG=setup; shift ;;
     --no-telegram)  TG_FLAG=off; shift ;;
+    --bitrix)       BX_FLAG=setup; shift ;;
+    --no-bitrix)    BX_FLAG=off; shift ;;
     --page-url)     need_value "$1" "${2:-}"; PAGE_FLAG="$2"; shift 2 ;;
     --serve-page)   PAGE_FLAG=off; shift ;;
     -h|--help)      sed -n '2,29p' "$0"; exit 0 ;;
@@ -125,6 +130,7 @@ CLI
   app.py import FILE.csv           import old leads (e.g. exported Google Sheet)
   app.py stats                     print counts
   app.py telegram-test             post a test message to the Telegram channel
+  app.py bitrix-setup OUTFILE      interactive Bitrix24 webhook setup (used by install.sh)
   app.py telegram-setup OUTFILE    interactive bot/channel setup (used by install.sh)
 """
 import base64
@@ -175,6 +181,10 @@ TELEGRAM_BOT_TOKEN = env("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = env("TELEGRAM_CHAT_ID")
 TG_ENABLED = bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
 TELEGRAM_API = env("TELEGRAM_API", "https://api.telegram.org").rstrip("/")  # override only for tests
+BITRIX_WEBHOOK_URL = env("BITRIX_WEBHOOK_URL").rstrip("/")
+BITRIX_CATEGORY_ID = env("BITRIX_CATEGORY_ID", "0")
+BITRIX_STAGE_ID = env("BITRIX_STAGE_ID", "NEW")
+BX_ENABLED = bool(BITRIX_WEBHOOK_URL)
 RATE_LIMIT = int(env("RATE_LIMIT_PER_10MIN", "5"))
 BACKUP_KEEP = int(env("BACKUP_KEEP", "30"))
 TZ_OFFSET = float(env("TZ_OFFSET_HOURS", "5"))  # Kazakhstan, UTC+5 since 2024
@@ -218,7 +228,11 @@ CREATE TABLE IF NOT EXISTS leads (
   tg_status        TEXT NOT NULL DEFAULT 'skipped', -- Telegram channel: pending|sent|failed|skipped
   tg_attempts      INTEGER NOT NULL DEFAULT 0,
   tg_last_try      TEXT NOT NULL DEFAULT '',
-  tg_error         TEXT NOT NULL DEFAULT ''
+  tg_error         TEXT NOT NULL DEFAULT '',
+  bx_status        TEXT NOT NULL DEFAULT 'skipped', -- Bitrix24 deal: pending|sent|failed|skipped
+  bx_attempts      INTEGER NOT NULL DEFAULT 0,
+  bx_last_try      TEXT NOT NULL DEFAULT '',
+  bx_error         TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_leads_created ON leads(created_at);
 CREATE INDEX IF NOT EXISTS idx_leads_phone   ON leads(phone_digits);
@@ -231,6 +245,10 @@ MIGRATIONS = (
     ("tg_attempts", "INTEGER NOT NULL DEFAULT 0"),
     ("tg_last_try", "TEXT NOT NULL DEFAULT ''"),
     ("tg_error", "TEXT NOT NULL DEFAULT ''"),
+    ("bx_status", "TEXT NOT NULL DEFAULT 'skipped'"),
+    ("bx_attempts", "INTEGER NOT NULL DEFAULT 0"),
+    ("bx_last_try", "TEXT NOT NULL DEFAULT ''"),
+    ("bx_error", "TEXT NOT NULL DEFAULT ''"),
 )
 
 
@@ -329,14 +347,15 @@ def validate_lead(fields):
 
 
 def insert_lead(db, lead, created_at=None, ip="", ua="", origin="web",
-                payload="", forward_status="pending", tg_status="skipped"):
+                payload="", forward_status="pending", tg_status="skipped",
+                bx_status="skipped"):
     cols = ["created_at", "name", "phone", "phone_digits", "city", "page",
             *UTM_KEYS, "extra", "ip", "user_agent", "origin", "payload",
-            "forward_status", "tg_status"]
+            "forward_status", "tg_status", "bx_status"]
     vals = [iso(created_at or utcnow()), lead["name"], lead["phone"],
             lead["phone_digits"], lead["city"], lead["page"],
             *[lead[k] for k in UTM_KEYS], lead["extra"], ip, ua[:300], origin,
-            payload, forward_status, tg_status]
+            payload, forward_status, tg_status, bx_status]
     cur = db.execute(
         "INSERT INTO leads (%s) VALUES (%s)" % (",".join(cols), ",".join("?" * len(cols))),
         vals)
@@ -439,12 +458,79 @@ def telegram_once(row):
     return False, str(res.get("description") or res)[:300]
 
 
-# ------------------------------------------- delivery (Sheet + Telegram) ----
+# ------------------------------------------------------- Bitrix24 deals ----
+
+class BitrixError(Exception):
+    pass
+
+
+def bx_call(base, method, payload=None, timeout=30):
+    """Bitrix24 REST call through an inbound webhook. Returns "result"; raises
+    BitrixError with Bitrix's own message. The webhook URL is secret: it must
+    never get into an error text."""
+    req = urllib.request.Request(
+        "%s/%s.json" % (base, method), data=json.dumps(payload or {}).encode("utf-8"), method="POST",
+        headers={"Content-Type": "application/json", "User-Agent": "airl-workshop-backend/1.0"})
+    try:
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                data = json.loads(r.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            try:
+                data = json.loads(e.read().decode("utf-8"))
+            except ValueError:
+                raise BitrixError("HTTP %s" % e.code) from None
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        raise BitrixError(type(e).__name__) from None
+    if not isinstance(data, dict) or "result" not in data:
+        data = data if isinstance(data, dict) else {}
+        raise BitrixError(str(data.get("error_description") or data.get("error") or "bad answer")[:300])
+    return data["result"]
+
+
+def bitrix_contact_id(row):
+    """Contact for the lead's phone: an existing one, or a new one."""
+    phone = "+" + wa_digits(row["phone_digits"])
+    found = bx_call(BITRIX_WEBHOOK_URL, "crm.duplicate.findbycomm",
+                    {"type": "PHONE", "values": [phone], "entity_type": "CONTACT"})
+    ids = found.get("CONTACT") if isinstance(found, dict) else None
+    if ids:
+        return ids[0]
+    return bx_call(BITRIX_WEBHOOK_URL, "crm.contact.add", {"fields": {
+        "NAME": row["name"], "ADDRESS_CITY": row["city"], "OPENED": "Y",
+        "PHONE": [{"VALUE": phone, "VALUE_TYPE": "WORK"}]}})
+
+
+def bitrix_once(row):
+    """Creates the deal. A timed-out call may have worked on Bitrix's side, so
+    retries first look for the deal by ORIGIN_ID to avoid a duplicate."""
+    origin_id = "lead-%d" % row["id"]
+    if row["bx_attempts"]:
+        same = bx_call(BITRIX_WEBHOOK_URL, "crm.deal.list", {
+            "filter": {"ORIGINATOR_ID": "airl-workshop", "ORIGIN_ID": origin_id}, "select": ["ID"]})
+        if same:
+            return True, ""
+    utm = {"UTM_SOURCE": row["utm_source"], "UTM_MEDIUM": row["utm_medium"],
+           "UTM_CAMPAIGN": row["utm_campaign"], "UTM_CONTENT": row["utm_content"],
+           "UTM_TERM": row["utm_term"]}
+    comments = "Заявка №%d с сайта\nТелефон: %s\nГород: %s\nСтраница: %s" % (
+        row["id"], row["phone"], row["city"], row["page"])
+    bx_call(BITRIX_WEBHOOK_URL, "crm.deal.add", {"fields": {
+        "TITLE": "Заявка на воркшоп: %s" % row["name"],
+        "CATEGORY_ID": BITRIX_CATEGORY_ID, "STAGE_ID": BITRIX_STAGE_ID,
+        "CONTACT_ID": bitrix_contact_id(row), "SOURCE_ID": "WEB", "OPENED": "Y",
+        "ORIGINATOR_ID": "airl-workshop", "ORIGIN_ID": origin_id,
+        "COMMENTS": comments, **{k: v for k, v in utm.items() if v}}})
+    return True, ""
+
+
+# ------------------------------- delivery (Sheet + Telegram + Bitrix24) ----
 
 CHANNELS = {
     # name: (status, attempts, last_try, error columns, label)
     "sheet": ("forward_status", "forward_attempts", "forward_last_try", "forward_error", "Google Sheet"),
     "tg": ("tg_status", "tg_attempts", "tg_last_try", "tg_error", "Telegram"),
+    "bx": ("bx_status", "bx_attempts", "bx_last_try", "bx_error", "Bitrix24"),
 }
 
 
@@ -464,6 +550,8 @@ class Notifier(threading.Thread):
             self.q.put((lead_id, "sheet"))
         if TG_ENABLED:
             self.q.put((lead_id, "tg"))
+        if BX_ENABLED:
+            self.q.put((lead_id, "bx"))
 
     def run(self):
         self.retry_due()
@@ -484,6 +572,8 @@ class Notifier(threading.Thread):
         try:
             if ch == "sheet":
                 ok, err = forward_once(row["payload"])
+            elif ch == "bx":
+                ok, err = bitrix_once(row)
             else:
                 ok, err = telegram_once(row)
         except Exception as e:  # network errors, timeouts
@@ -498,7 +588,7 @@ class Notifier(threading.Thread):
     def retry_due(self):
         since = iso(utcnow() - timedelta(days=self.RETRY_WINDOW_DAYS))
         now = utcnow()
-        for ch, enabled in (("sheet", FORWARD_ENABLED), ("tg", TG_ENABLED)):
+        for ch, enabled in (("sheet", FORWARD_ENABLED), ("tg", TG_ENABLED), ("bx", BX_ENABLED)):
             if not enabled:
                 continue
             st, att, last, _, _ = CHANNELS[ch]
@@ -517,7 +607,7 @@ class Notifier(threading.Thread):
 
 EXPORT_HEAD = ["№", "Дата (UTC+%g)" % TZ_OFFSET, "Имя", "Телефон", "Город",
                "utm_source", "utm_medium", "utm_campaign", "utm_content",
-               "utm_term", "Страница", "Источник", "Google Sheet", "Telegram"]
+               "utm_term", "Страница", "Источник", "Google Sheet", "Telegram", "Bitrix24"]
 
 
 def export_rows(db):
@@ -526,7 +616,7 @@ def export_rows(db):
         yield [r["id"], local_str(r["created_at"]), r["name"], r["phone"],
                r["city"], r["utm_source"], r["utm_medium"], r["utm_campaign"],
                r["utm_content"], r["utm_term"], r["page"], r["origin"],
-               r["forward_status"], r["tg_status"]]
+               r["forward_status"], r["tg_status"], r["bx_status"]]
 
 
 def csv_safe(v):
@@ -665,6 +755,7 @@ def render_admin(db, q, page):
                   (iso(now - timedelta(days=7)),))["c"]
     failed = db.one("SELECT COUNT(*) c FROM leads WHERE forward_status='failed'")["c"]
     tg_failed = db.one("SELECT COUNT(*) c FROM leads WHERE tg_status='failed'")["c"]
+    bx_failed = db.one("SELECT COUNT(*) c FROM leads WHERE bx_status='failed'")["c"]
 
     where, params = "", []
     if q:
@@ -689,7 +780,8 @@ def render_admin(db, q, page):
             wa = "7" + wa[1:]
         utm = " / ".join(x for x in (r["utm_source"], r["utm_medium"], r["utm_campaign"]) if x)
         delivery = (status_html("Таблица", r["forward_status"], r["forward_error"]) +
-                    status_html("Telegram", r["tg_status"], r["tg_error"]))
+                    status_html("Telegram", r["tg_status"], r["tg_error"]) +
+                    status_html("Битрикс", r["bx_status"], r["bx_error"]))
         trs.append(
             "<tr><td class=n>%d</td><td>%s</td><td>%s</td>"
             "<td><a href='tel:+%s'>%s</a><br><a class=mut href='https://wa.me/%s' target=_blank rel=noopener>WhatsApp</a></td>"
@@ -711,11 +803,13 @@ def render_admin(db, q, page):
             "<a class='btn sec' href='%s'>← Новее</a>" % esc(link(page - 1)) if page > 1 else "",
             page, pages,
             "<a class='btn sec' href='%s'>Старее →</a>" % esc(link(page + 1)) if page < pages else "")
-    targets = [x for x, on in (("Google Sheet", FORWARD_ENABLED), ("Telegram", TG_ENABLED)) if on]
+    targets = [x for x, on in (("Google Sheet", FORWARD_ENABLED), ("Telegram", TG_ENABLED),
+                                       ("Битрикс", BX_ENABLED)) if on]
     sheet_note = ("Каждая заявка также уходит в: %s." % ", ".join(targets) if targets
                   else "Заявки сохраняются только здесь.")
-    if failed or tg_failed:
-        sheet_note += " Пока не доставлено: таблица %d, Telegram %d (повторится автоматически)." % (failed, tg_failed)
+    if failed or tg_failed or bx_failed:
+        sheet_note += " Пока не доставлено: таблица %d, Telegram %d, Битрикс %d (повторится автоматически)." % (
+            failed, tg_failed, bx_failed)
 
     return ("<!doctype html><html lang=ru><head><meta charset=utf-8>"
             "<meta name=viewport content='width=device-width,initial-scale=1'>"
@@ -818,7 +912,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/health":
             n = self.app.db.one("SELECT COUNT(*) c FROM leads")["c"]
             return self.json(200, {"ok": True, "leads": n, "forward": FORWARD_ENABLED,
-                                   "telegram": TG_ENABLED})
+                                   "telegram": TG_ENABLED, "bitrix": BX_ENABLED})
         if path in ("/admin", "/admin/"):
             if not self.check_admin():
                 return
@@ -898,7 +992,8 @@ class Handler(BaseHTTPRequestHandler):
         lead_id = insert_lead(db, lead, ip=ip, ua=self.headers.get("User-Agent", ""),
                               payload=payload,
                               forward_status="pending" if FORWARD_ENABLED else "skipped",
-                              tg_status="pending" if TG_ENABLED else "skipped")
+                              tg_status="pending" if TG_ENABLED else "skipped",
+                              bx_status="pending" if BX_ENABLED else "skipped")
         log.info("new lead %s saved", lead_id)
         self.app.notifier.submit(lead_id)
         self.json(200, {"ok": True, "id": lead_id})
@@ -908,8 +1003,9 @@ def serve():
     app = App()
     Handler.app = app
     app.notifier.start()
-    log.info("copies to Google Sheet: %s, to Telegram: %s",
-             "on" if FORWARD_ENABLED else "off", "on" if TG_ENABLED else "off")
+    log.info("copies to Google Sheet: %s, to Telegram: %s, to Bitrix24: %s",
+             "on" if FORWARD_ENABLED else "off", "on" if TG_ENABLED else "off",
+             "on" if BX_ENABLED else "off")
     if not ADMIN_PASSWORD:
         log.warning("ADMIN_PASSWORD is empty: /admin is disabled")
     httpd = ThreadingHTTPServer((HOST, PORT), Handler)
@@ -1019,7 +1115,7 @@ def cmd_import(path):
 def cmd_stats():
     db = DB(DB_PATH)
     print("%-18s %d" % ("total", db.one("SELECT COUNT(*) c FROM leads")["c"]))
-    for col, name in (("forward_status", "sheet"), ("tg_status", "telegram")):
+    for col, name in (("forward_status", "sheet"), ("tg_status", "telegram"), ("bx_status", "bitrix")):
         for st in ("sent", "failed", "pending"):
             n = db.one("SELECT COUNT(*) c FROM leads WHERE %s=?" % col, (st,))["c"]
             print("%-18s %d" % ("%s %s" % (name, st), n))
@@ -1104,6 +1200,42 @@ def cmd_telegram_setup(out_path):
     sys.exit("Telegram: канал не настроен.")
 
 
+def cmd_bitrix_setup(out_path):
+    """Interactive, run by install.sh on the server. Asks for the inbound webhook
+    URL (hidden input), finds the stage "Новая" of the main funnel with a read-only
+    call, and writes 'url\\nstage_id\\n' to out_path (mode 600). Creates nothing."""
+    import getpass
+    try:
+        tty = open("/dev/tty", "w", encoding="utf-8")
+    except OSError:
+        sys.exit("Bitrix24 setup needs an interactive terminal.")
+
+    def say(msg):
+        tty.write(msg + "\n")
+        tty.flush()
+
+    for _ in range(3):
+        url = getpass.getpass("Адрес входящего вебхука Битрикс24 (ввод скрыт): ", stream=tty).strip().rstrip("/")
+        if not re.match(r"^https://[\w.-]+/rest/\d+/[\w-]+$", url):
+            say("  Нужен адрес вида https://компания.bitrix24.kz/rest/1/код/")
+            continue
+        try:
+            stages = bx_call(url, "crm.dealcategory.stage.list", {"id": 0})
+        except BitrixError as e:
+            say("  Битрикс не принял адрес: %s" % e)
+            continue
+        stage = next((x for x in stages if x.get("NAME", "").strip().lower() == "новая"), None)
+        if not stage:
+            say("  В основной воронке нет этапа «Новая». Этапы: %s" % ", ".join(x.get("NAME", "") for x in stages))
+            sys.exit("Bitrix24: этап не найден.")
+        say("  Этап: %s (%s)" % (stage["NAME"], stage["STATUS_ID"]))
+        fd = os.open(out_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write("%s\n%s\n" % (url, stage["STATUS_ID"]))
+        return
+    sys.exit("Bitrix24: адрес не подошёл.")
+
+
 def cmd_telegram_test():
     if not TG_ENABLED:
         sys.exit("Telegram is not configured (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID).")
@@ -1126,6 +1258,8 @@ def main(argv):
         cmd_telegram_setup(argv[2])
     elif cmd == "telegram-test":
         cmd_telegram_test()
+    elif cmd == "bitrix-setup" and len(argv) > 2:
+        cmd_bitrix_setup(argv[2])
     else:
         print(__doc__)
         sys.exit(2)
@@ -1587,6 +1721,23 @@ elif [ "$TG_FLAG" = setup ]; then
   rm -f "$TG_TMP"
 fi
 
+# ------------------------------------------------------------- Bitrix24 ----
+BX_URL="$(get_env BITRIX_WEBHOOK_URL)"
+BX_STAGE="$(get_env BITRIX_STAGE_ID)"
+if [ "$BX_FLAG" = off ]; then
+  BX_URL=""; BX_STAGE=""
+elif [ "$BX_FLAG" = setup ]; then
+  info "Connecting Bitrix24"
+  BX_TMP="$(mktemp)"
+  if "$PY" "$BASE/app/app.py" bitrix-setup "$BX_TMP"; then
+    BX_URL="$(sed -n 1p "$BX_TMP")"; BX_STAGE="$(sed -n 2p "$BX_TMP")"
+    ok "Bitrix24 connected"
+  else
+    warn "Bitrix24 was not connected; everything else continues. Run again with --bitrix to retry."
+  fi
+  rm -f "$BX_TMP"
+fi
+
 # --------------------------------------------------------- backend port ----
 # Other apps may already listen on local ports, so take the first free one.
 systemctl stop airl-workshop.service >/dev/null 2>&1 || true
@@ -1608,7 +1759,7 @@ ADMIN_USER="$(get_env ADMIN_USER)"; ADMIN_USER="${ADMIN_USER:-admin}"
 FWD_ENABLED="${FORWARD_FLAG:-$(get_env FORWARD_ENABLED)}"; FWD_ENABLED="${FWD_ENABLED:-1}"
 OTHER_LINES=""
 if [ -f "$ENV_FILE" ]; then
-  OTHER_LINES="$(grep -vE '^(#|$|ADMIN_USER=|ADMIN_PASSWORD=|FORWARD_URL=|FORWARD_ENABLED=|SITE_DOMAIN=|SITE_WHATSAPP=|SITE_PAGE_URL=|TELEGRAM_BOT_TOKEN=|TELEGRAM_CHAT_ID=|HOST=|PORT=|DATA_DIR=|BACKUP_DIR=)' "$ENV_FILE" || true)"
+  OTHER_LINES="$(grep -vE '^(#|$|ADMIN_USER=|ADMIN_PASSWORD=|FORWARD_URL=|FORWARD_ENABLED=|SITE_DOMAIN=|SITE_WHATSAPP=|SITE_PAGE_URL=|TELEGRAM_BOT_TOKEN=|TELEGRAM_CHAT_ID=|BITRIX_WEBHOOK_URL=|BITRIX_STAGE_ID=|HOST=|PORT=|DATA_DIR=|BACKUP_DIR=)' "$ENV_FILE" || true)"
 fi
 umask 077
 cat > "$ENV_FILE" <<EOF
@@ -1621,6 +1772,9 @@ FORWARD_URL=$FOUND_FORWARD
 # Telegram channel for leads (set up with: bash install.sh --telegram)
 TELEGRAM_BOT_TOKEN=$TG_TOKEN
 TELEGRAM_CHAT_ID=$TG_CHAT
+# Bitrix24 deals (set up with: bash install.sh --bitrix). The webhook URL is secret.
+BITRIX_WEBHOOK_URL=$BX_URL
+BITRIX_STAGE_ID=${BX_STAGE:-NEW}
 # Page settings
 SITE_DOMAIN=$DOMAIN
 SITE_WHATSAPP=$WA_NUM
@@ -2070,6 +2224,8 @@ echo "  Web server:      $WEB"
 echo "  Google Sheet:    copy of each lead $FWD_STATE"
 if [ -n "$TG_TOKEN" ] && [ -n "$TG_CHAT" ]; then TG_STATE="on (channel $TG_CHAT)"; else TG_STATE="off (connect with: bash install.sh --telegram)"; fi
 echo "  Telegram:        $TG_STATE"
+if [ -n "$BX_URL" ]; then BX_STATE="on (deals, stage ${BX_STAGE:-NEW})"; else BX_STATE="off (connect with: bash install.sh --bitrix)"; fi
+echo "  Bitrix24:        $BX_STATE"
 if [ -n "$WA_NUM" ]; then WA_STATE="after the form the page opens WhatsApp chat with +$WA_NUM"; else WA_STATE="off"; fi
 echo "  WhatsApp:        $WA_STATE"
 if [ -n "$PAGE_URL" ]; then echo "  Page:            $PAGE_URL (this server redirects there)"; fi
