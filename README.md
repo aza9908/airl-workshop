@@ -1,20 +1,26 @@
 # AIRL: воркшоп «Готовый продукт за 1 день»
 
-Лендинг воркшопа и всё, что нужно для его работы на нашем сервере:
-страница, бэкенд заявок, админка и скрипт установки.
+Лендинг воркшопа и всё, что нужно для его работы: страница, бэкенд заявок,
+админка и скрипт установки сервера.
 
-- Сайт: https://server.airl.kz
-- Админка заявок: https://server.airl.kz/admin (логин `admin`, пароль в `/etc/airl-workshop.env` на сервере)
-- Сервер: 89.35.124.238, Ubuntu 24.04, nginx (там же trainer, kaidzen и pingwin)
-- Прежний адрес: https://airl-workshop.web.app (Firebase)
+- Страница: **https://airl.kz/ai-for-work/workshop/** (папка `ai-for-work/workshop/` в репозитории
+  `aza9908/landing`, публикуется Firebase App Hosting вместе с остальным airl.kz)
+- Бэкенд заявок и админка: https://server.airl.kz/api/lead и https://server.airl.kz/admin
+  (логин `admin`, пароль в `/etc/airl-workshop.env` на сервере)
+- Сервер: 89.35.124.238, Ubuntu 24.04, nginx (там же trainer, kaidzen и pingwin).
+  Посетителей самого server.airl.kz он отправляет на airl.kz/ai-for-work/workshop/ (с UTM-метками).
+- Прежние адреса: https://airl-workshop.web.app (Firebase, старая форма в Google-таблицу),
+  https://server.airl.kz (теперь редирект)
 
 ## Что где лежит
 
 | Путь | Что это |
 |---|---|
 | `site/` | Готовая сборка страницы: HTML, JS, CSS, картинки, шрифты. Копируется с airl-workshop.web.app GitHub Action'ом (см. ниже). |
+| `hq/` | Фото в высоком разрешении (оригиналы с airl.kz, то же кадрирование). При сборке подменяют файлы из `site/` с тем же именем. |
+| `build-airl.sh` | Собирает страницу для airl.kz в `dist/airl/`: пути под `/ai-for-work/workshop/`, форма на server.airl.kz, WhatsApp, фото из `hq/`. |
 | `app/app.py` | Бэкенд заявок. Python 3.8+, без сторонних библиотек. |
-| `app/sitetool.py` | Копирует страницу и готовит её к серверу: форма шлёт заявки на `/api/lead`, подставляется номер WhatsApp. |
+| `app/sitetool.py` | Копирует страницу и готовит её к публикации: адрес формы, номер WhatsApp, подпапка, фото из `hq/`. |
 | `install.template.sh` + `build.py` | Исходник скрипта установки. `python3 build.py` собирает из них и `app/*.py` один файл `install.sh`. |
 | `install.sh` | Готовый скрипт установки и обновления, один файл. |
 
@@ -24,7 +30,7 @@
 ## Как проходит заявка
 
 1. Человек заполняет форму (имя, телефон, город). UTM-метки из ссылки добавляются сами.
-2. Страница отправляет заявку на `/api/lead` нашего сервера.
+2. Страница отправляет заявку на https://server.airl.kz/api/lead.
 3. Бэкенд сохраняет её в базу (`/opt/airl-workshop/data/leads.db`) и отправляет:
    - копию в Google Sheet (через старый Apps Script, чтобы таблица продолжала пополняться);
    - сообщение в Telegram-канал с именем, телефоном, городом, меткой рекламы и ссылкой «Написать в WhatsApp».
@@ -35,6 +41,15 @@
 Защита формы: скрытое поле от ботов, не больше 5 заявок с одного адреса за 10 минут,
 повтор того же телефона в течение 2 минут не создаёт дубль.
 
+## Как обновить страницу на airl.kz
+
+1. При необходимости заменить фото в `hq/assets/` (имя файла как в `site/assets/`) или скачать
+   свежую страницу с Firebase (Actions → «Copy live page into site/»).
+2. `./build-airl.sh`
+3. Скопировать `dist/airl/` в репозиторий `aza9908/landing` как `ai-for-work/workshop/`
+   (старую папку заменить целиком), закоммитить и запушить в `main`. Firebase App Hosting
+   опубликует за несколько минут. Остальные файлы сайта при этом не меняются.
+
 ## Установка и обновление на сервере
 
 С компьютера:
@@ -42,7 +57,7 @@
 ```
 scp install.sh root@89.35.124.238:/root/
 ssh root@89.35.124.238
-bash install.sh --domain server.airl.kz --whatsapp 77072314955 --telegram
+bash install.sh --domain server.airl.kz --whatsapp 77072314955 --telegram --page-url https://airl.kz/ai-for-work/workshop/
 ```
 
 Скрипт можно запускать повторно: заявки, пароль админки и настройки сохраняются, перед
@@ -62,6 +77,8 @@ certbot, продление автоматическое. На сервере б
 | `--whatsapp NUM` / `--no-whatsapp` | номер менеджера для шага WhatsApp после формы / выключить |
 | `--telegram` / `--no-telegram` | подключить Telegram-канал (скрипт спросит токен бота) / отключить |
 | `--forward` / `--no-forward` | включить / выключить копию заявок в Google Sheet |
+| `--page-url URL` | страница живёт по другому адресу: посетители сервера уходят туда (с UTM), `/api` и `/admin` работают как раньше |
+| `--serve-page` | снова отдавать страницу с этого сервера (отменяет `--page-url`) |
 | `--refresh-site` | заново скачать страницу с airl-workshop.web.app |
 | `--from-dir PATH` | взять страницу из локальной папки (например, `site/` из этого репозитория) |
 

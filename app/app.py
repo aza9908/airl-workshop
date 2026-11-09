@@ -711,7 +711,8 @@ class Handler(BaseHTTPRequestHandler):
         path = self.path_only()
         if path == "/api/health":
             n = self.app.db.one("SELECT COUNT(*) c FROM leads")["c"]
-            return self.json(200, {"ok": True, "leads": n, "forward": FORWARD_ENABLED})
+            return self.json(200, {"ok": True, "leads": n, "forward": FORWARD_ENABLED,
+                                   "telegram": TG_ENABLED})
         if path in ("/admin", "/admin/"):
             if not self.check_admin():
                 return

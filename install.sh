@@ -20,6 +20,9 @@
 #   --no-whatsapp     turn that WhatsApp step off
 #   --telegram        connect a Telegram channel for leads (asks for the bot token here)
 #   --no-telegram     stop posting leads to Telegram
+#   --page-url URL    the page itself lives elsewhere (e.g. https://airl.kz/ai-for-work/workshop/):
+#                     visitors of this server are sent there; /api and /admin keep working here
+#   --serve-page      serve the page from this server again (undo --page-url)
 #
 # Safe to run again: leads, admin password and settings are kept.
 set -Eeuo pipefail
@@ -34,6 +37,7 @@ FROM_DIR=""
 REFRESH=0
 FORWARD_FLAG=""
 WA_FLAG=""
+PAGE_FLAG=""
 TG_FLAG=""
 
 ok()   { printf '\033[32m✓\033[0m %s\n' "$*"; }
@@ -56,7 +60,9 @@ while [ $# -gt 0 ]; do
     --no-whatsapp)  WA_FLAG="off"; shift ;;
     --telegram)     TG_FLAG=setup; shift ;;
     --no-telegram)  TG_FLAG=off; shift ;;
-    -h|--help)      sed -n '2,26p' "$0"; exit 0 ;;
+    --page-url)     need_value "$1" "${2:-}"; PAGE_FLAG="$2"; shift 2 ;;
+    --serve-page)   PAGE_FLAG=off; shift ;;
+    -h|--help)      sed -n '2,29p' "$0"; exit 0 ;;
     *)              die "Unknown option: $1 (see --help)" ;;
   esac
 done
@@ -811,7 +817,8 @@ class Handler(BaseHTTPRequestHandler):
         path = self.path_only()
         if path == "/api/health":
             n = self.app.db.one("SELECT COUNT(*) c FROM leads")["c"]
-            return self.json(200, {"ok": True, "leads": n, "forward": FORWARD_ENABLED})
+            return self.json(200, {"ok": True, "leads": n, "forward": FORWARD_ENABLED,
+                                   "telegram": TG_ENABLED})
         if path in ("/admin", "/admin/"):
             if not self.check_admin():
                 return
@@ -1138,9 +1145,16 @@ Copy the deployed workshop page and prepare it for the VPS. Stdlib only.
       images, icons, og-image) into DIR, keeping paths.
 
   sitetool.py build --mirror DIR --out DIR2 --base-url https://example.kz --source URL
-      Copies DIR to DIR2, points the form at /api/lead instead of Google Apps
-      Script, rewrites absolute links to the old host, adds a 404 page.
+          [--whatsapp NUM] [--api-url URL] [--base-path /sub/path/] [--overlay DIR]
+      Copies DIR to DIR2, points the form at --api-url instead of Google Apps
+      Script, sets the WhatsApp number, swaps in higher-quality files, rewrites
+      links for a sub-path and to the old host, renames changed files by hash.
       Prints JSON: {"forward_url": "<the Apps Script URL found>", ...}
+
+  For airl.kz/ai-for-work/workshop/:
+      sitetool.py build --mirror site --out dist --overlay hq \
+          --base-url https://airl.kz/ai-for-work/workshop --base-path /ai-for-work/workshop/ \
+          --api-url https://server.airl.kz/api/lead --whatsapp 77072314955
 """
 import argparse
 import hashlib
@@ -1287,101 +1301,149 @@ def normalize_wa(number):
     return d
 
 
-def build(mirror_dir, out, base_url, source, whatsapp=None):
+def _read(p):
+    with open(p, "r", encoding="utf-8", errors="surrogateescape") as f:
+        return f.read()
+
+
+def _write(p, text):
+    with open(p, "w", encoding="utf-8", errors="surrogateescape") as f:
+        f.write(text)
+
+
+def _text_files(root, exts=(".html", ".js", ".mjs", ".css", ".webmanifest")):
+    for dirpath, _, files in os.walk(root):
+        for name in files:
+            if name.endswith(exts):
+                yield os.path.join(dirpath, name)
+
+
+def _sha(p):
+    with open(p, "rb") as f:
+        return hashlib.sha256(f.read()).hexdigest()
+
+
+def build(mirror_dir, out, base_url, source, whatsapp=None, api_url="/api/lead",
+          base_path="/", overlay=None):
+    """base_url: public address of the page (for og:url/og:image), e.g.
+    https://airl.kz/ai-for-work/workshop. base_path: URL path the files are
+    served under, e.g. /ai-for-work/workshop/. overlay: folder with files that
+    replace mirrored ones by the same relative path (higher-quality photos)."""
     if not os.path.exists(os.path.join(mirror_dir, "index.html")):
         sys.exit("ERROR: %s has no index.html" % mirror_dir)
+    base_path = "/" + base_path.strip("/") + "/" if base_path.strip("/") else "/"
     if os.path.exists(out):
         shutil.rmtree(out)
     shutil.copytree(mirror_dir, out, ignore=shutil.ignore_patterns(".mirror.json"))
+    original = {os.path.relpath(p, out): _sha(p)
+                for p in (os.path.join(d, n) for d, _, fs in os.walk(out) for n in fs)}
 
+    # 1. higher-quality files over the mirrored ones (same names)
+    replaced = []
+    if overlay:
+        for dirpath, _, files in os.walk(overlay):
+            for name in files:
+                src = os.path.join(dirpath, name)
+                rel = os.path.relpath(src, overlay)
+                if rel not in original:
+                    print("WARNING: overlay file %s has no counterpart in the page, skipped" % rel,
+                          file=sys.stderr)
+                    continue
+                shutil.copyfile(src, os.path.join(out, rel))
+                replaced.append(rel)
+
+    # 2. form: Google Apps Script -> our backend
     found, patched = [], []
-    for dirpath, _, files in os.walk(out):
-        for name in files:
-            if not name.endswith((".js", ".mjs", ".html")):
-                continue
-            p = os.path.join(dirpath, name)
-            with open(p, "r", encoding="utf-8", errors="surrogateescape") as f:
-                text = f.read()
-            urls = GAS_RE.findall(text)
-            if urls:
-                found += urls
-                text = GAS_RE.sub("/api/lead", text)
-                patched.append(os.path.relpath(p, out))
-                with open(p, "w", encoding="utf-8", errors="surrogateescape") as f:
-                    f.write(text)
+    for p in _text_files(out, (".js", ".mjs", ".html")):
+        text = _read(p)
+        urls = GAS_RE.findall(text)
+        if urls:
+            found += urls
+            _write(p, GAS_RE.sub(api_url, text))
+            patched.append(os.path.relpath(p, out))
     uniq = sorted(set(found))
     if len(uniq) != 1:
         sys.exit("ERROR: expected exactly one Google Apps Script URL in the site code, found %d. "
                  "The page code has changed; the form would not reach the new server." % len(uniq))
 
+    # 3. WhatsApp number of the manager
     wa = normalize_wa(whatsapp) if whatsapp is not None else None
     if wa is not None:
+        wa_re = re.compile(r'([`"\'])(' + re.escape(api_url) + r')\1(\s*,\s*[A-Za-z_$][\w$]*\s*=\s*)'
+                           r'([`"\'])([^`"\'\n]{0,30})\4(\s*\.replace\(/\\D/g)')
         hits = 0
         for rel in patched:
             p = os.path.join(out, rel)
-            with open(p, "r", encoding="utf-8", errors="surrogateescape") as f:
-                text = f.read()
-            text, n = WA_RE.subn(lambda m: "%s%s%s%s%s%s%s%s" % (
-                m.group(1), m.group(2), m.group(1), m.group(3), m.group(4), wa, m.group(4), m.group(6)), text)
+            text, n = wa_re.subn(lambda m: "%s%s%s%s%s%s%s%s" % (
+                m.group(1), m.group(2), m.group(1), m.group(3), m.group(4), wa, m.group(4), m.group(6)),
+                _read(p))
             hits += n
             if n:
-                with open(p, "w", encoding="utf-8", errors="surrogateescape") as f:
-                    f.write(text)
+                _write(p, text)
         if hits != 1 and wa:
             print("WARNING: could not find the WhatsApp number setting in the page code (found %d); "
                   "the WhatsApp step stays off." % hits, file=sys.stderr)
             wa = ""
 
+    # 4. absolute links to the old host (og:url, og:image)
     index = os.path.join(out, "index.html")
-    with open(index, "r", encoding="utf-8") as f:
-        text = f.read()
+    text = _read(index)
     old = source.rstrip("/")
     new = base_url.rstrip("/")
     if old and new and old != new:
         text = text.replace(old + "/", new + "/").replace(old, new)
-    with open(index, "w", encoding="utf-8") as f:
-        f.write(text)
+    if new and 'rel="canonical"' not in text:
+        text = text.replace("</head>", '  <link rel="canonical" href="%s/">\n  </head>' % new, 1)
+    _write(index, text)
 
-    # Changed code files get a new name with a hash of their content
-    # (index-X.js -> index-X.<hash>.js) and every reference is updated. Assets
-    # are cached by browsers for a year, so a file whose content changed must
-    # never keep its old name, or visitors keep running the old copy.
+    # 5. files whose content changed get a new name (name.<hash>.ext), so
+    # browsers that cached the old file for a year load the new one
     renamed = {}
-    for rel in [r for r in patched if r.endswith((".js", ".mjs"))]:
-        p = os.path.join(out, rel)
-        with open(p, "rb") as f:
-            digest = hashlib.sha256(f.read()).hexdigest()[:8]
-        stem, ext = os.path.splitext(os.path.basename(rel))
-        new_name = "%s.%s%s" % (stem, digest, ext)
-        os.rename(p, os.path.join(os.path.dirname(p), new_name))
-        renamed[os.path.basename(rel)] = new_name
+    for dirpath, _, files in os.walk(out):
+        for name in files:
+            p = os.path.join(dirpath, name)
+            rel = os.path.relpath(p, out)
+            if not rel.startswith("assets" + os.sep) or original.get(rel) == _sha(p):
+                continue
+            stem, ext = os.path.splitext(name)
+            new_name = "%s.%s%s" % (stem, _sha(p)[:8], ext)
+            os.rename(p, os.path.join(dirpath, new_name))
+            renamed[name] = new_name
     if renamed:
-        for dirpath, _, files in os.walk(out):
-            for name in files:
-                if not name.endswith((".html", ".js", ".mjs", ".css", ".webmanifest")):
-                    continue
-                p = os.path.join(dirpath, name)
-                with open(p, "r", encoding="utf-8", errors="surrogateescape") as f:
-                    text = f.read()
-                new_text = text
-                for old_name, new_name in renamed.items():
-                    new_text = re.sub(r"(?<=[/\"'`])" + re.escape(old_name) + r"(?=[\"'`?#)])",
-                                      new_name, new_text)
-                if new_text != text:
-                    with open(p, "w", encoding="utf-8", errors="surrogateescape") as f:
-                        f.write(new_text)
-        with open(index, "r", encoding="utf-8") as f:
-            index_text = f.read()
-        for new_name in renamed.values():
-            if new_name not in index_text:
-                sys.exit("ERROR: index.html does not reference %s after renaming" % new_name)
-        patched = [os.path.join(os.path.dirname(r), renamed.get(os.path.basename(r), os.path.basename(r)))
-                   for r in patched]
+        pat = re.compile(r"(?<=[/\"'`(])(%s)(?=[\"'`?#)])" % "|".join(re.escape(n) for n in renamed))
+        for p in _text_files(out):
+            text = _read(p)
+            new_text = pat.sub(lambda m: renamed[m.group(1)], text)
+            if new_text != text:
+                _write(p, new_text)
 
-    if not os.path.exists(os.path.join(out, "404.html")):
-        with open(os.path.join(out, "404.html"), "w", encoding="utf-8") as f:
-            f.write(NOT_FOUND)
-    print(json.dumps({"forward_url": uniq[0], "patched": patched, "whatsapp": wa}))
+    # 6. serve from a sub-path: /x -> <base_path>x for files that exist here
+    if base_path != "/":
+        local = lambda path: os.path.exists(os.path.join(out, path.lstrip("/").split("?")[0].split("#")[0]))
+        attr = re.compile(r'(\s(?:src|href)=["\'])(/[^/"\'][^"\']*)(["\'])')
+        cssurl = re.compile(r'(url\(\s*["\']?)(/[^/"\')][^"\')]*)(["\']?\s*\))')
+        jsstr = re.compile(r'([`"\'])(/assets/[^`"\'\s]+)([`"\'])')
+        fix = lambda m: m.group(1) + (base_path + m.group(2).lstrip("/") if local(m.group(2)) else m.group(2)) + m.group(3)
+        for p in _text_files(out):
+            text = _read(p)
+            if p.endswith(".html"):
+                new_text = attr.sub(fix, text)
+            elif p.endswith(".css"):
+                new_text = cssurl.sub(fix, text)
+            else:
+                new_text = jsstr.sub(fix, text)
+            if new_text != text:
+                _write(p, new_text)
+        left = [m.group(2) for m in attr.finditer(_read(index)) if local(m.group(2))]
+        if left:
+            sys.exit("ERROR: some links still point to the site root: %s" % left)
+    elif not os.path.exists(os.path.join(out, "404.html")):
+        _write(os.path.join(out, "404.html"), NOT_FOUND)
+
+    rename = lambda r: os.path.join(os.path.dirname(r), renamed.get(os.path.basename(r), os.path.basename(r)))
+    print(json.dumps({"forward_url": uniq[0], "patched": [rename(r) for r in patched],
+                      "photos": sorted(rename(r) for r in replaced), "whatsapp": wa,
+                      "api_url": api_url, "base_path": base_path}))
 
 
 def main():
@@ -1396,11 +1458,14 @@ def main():
     b.add_argument("--base-url", required=True)
     b.add_argument("--source", default="https://airl-workshop.web.app")
     b.add_argument("--whatsapp", default=None, help="manager number for the WhatsApp step; '' turns it off")
+    b.add_argument("--api-url", default="/api/lead", help="where the form sends leads")
+    b.add_argument("--base-path", default="/", help="URL path the page is served under")
+    b.add_argument("--overlay", default=None, help="folder with higher-quality files to swap in")
     a = ap.parse_args()
     if a.cmd == "mirror":
         mirror(a.source, a.out)
     else:
-        build(a.mirror, a.out, a.base_url, a.source, a.whatsapp)
+        build(a.mirror, a.out, a.base_url, a.source, a.whatsapp, a.api_url, a.base_path, a.overlay)
 
 
 if __name__ == "__main__":
@@ -1496,6 +1561,14 @@ chmod -R a+rX "$BASE/site.new"
 swap_dir "$BASE/site.new" "$BASE/site"
 ok "Form now sends leads to $BASE_URL/api/lead"
 if [ -n "$WA_NUM" ]; then ok "After the form, the page opens WhatsApp chat with +$WA_NUM"; fi
+if [ "$PAGE_FLAG" = off ]; then PAGE_URL=""
+elif [ -n "$PAGE_FLAG" ]; then PAGE_URL="$PAGE_FLAG"
+else PAGE_URL="$(get_env SITE_PAGE_URL)"; fi
+if [ -n "$PAGE_URL" ]; then
+  printf '%s' "$PAGE_URL" | grep -Eq '^https?://[A-Za-z0-9.-]+(/[A-Za-z0-9._~/-]*)?$' || die "Not a valid page address: $PAGE_URL"
+  case "$PAGE_URL" in */) ;; *) PAGE_URL="$PAGE_URL/" ;; esac
+  ok "Visitors of this server will be sent to $PAGE_URL (form and admin stay here)"
+fi
 
 # ------------------------------------------------------------ Telegram ----
 TG_TOKEN="$(get_env TELEGRAM_BOT_TOKEN)"
@@ -1535,7 +1608,7 @@ ADMIN_USER="$(get_env ADMIN_USER)"; ADMIN_USER="${ADMIN_USER:-admin}"
 FWD_ENABLED="${FORWARD_FLAG:-$(get_env FORWARD_ENABLED)}"; FWD_ENABLED="${FWD_ENABLED:-1}"
 OTHER_LINES=""
 if [ -f "$ENV_FILE" ]; then
-  OTHER_LINES="$(grep -vE '^(#|$|ADMIN_USER=|ADMIN_PASSWORD=|FORWARD_URL=|FORWARD_ENABLED=|SITE_DOMAIN=|SITE_WHATSAPP=|TELEGRAM_BOT_TOKEN=|TELEGRAM_CHAT_ID=|HOST=|PORT=|DATA_DIR=|BACKUP_DIR=)' "$ENV_FILE" || true)"
+  OTHER_LINES="$(grep -vE '^(#|$|ADMIN_USER=|ADMIN_PASSWORD=|FORWARD_URL=|FORWARD_ENABLED=|SITE_DOMAIN=|SITE_WHATSAPP=|SITE_PAGE_URL=|TELEGRAM_BOT_TOKEN=|TELEGRAM_CHAT_ID=|HOST=|PORT=|DATA_DIR=|BACKUP_DIR=)' "$ENV_FILE" || true)"
 fi
 umask 077
 cat > "$ENV_FILE" <<EOF
@@ -1551,6 +1624,8 @@ TELEGRAM_CHAT_ID=$TG_CHAT
 # Page settings
 SITE_DOMAIN=$DOMAIN
 SITE_WHATSAPP=$WA_NUM
+# Where the page itself lives; empty = served by this server
+SITE_PAGE_URL=$PAGE_URL
 HOST=127.0.0.1
 PORT=$PORT
 DATA_DIR=$BASE/data
@@ -1664,6 +1739,13 @@ nginx_site_body() {
         proxy_set_header X-Forwarded-For \$remote_addr;
         proxy_set_header X-Forwarded-Proto \$scheme;
     }
+EOF
+  if [ -n "$PAGE_URL" ]; then
+    cat <<EOF
+    location / { return 301 $PAGE_URL\$is_args\$args; }
+EOF
+  else
+    cat <<EOF
     location /assets/ {
         $HDRS
         add_header Cache-Control "public, max-age=31536000, immutable" always;
@@ -1678,6 +1760,7 @@ nginx_site_body() {
     error_page 404 /404.html;
     location = /404.html { internal; }
 EOF
+  fi
 }
 
 nginx_listen() {  # nginx_listen PORT [ssl]
@@ -1849,6 +1932,15 @@ SITE_CADDY=/etc/caddy/sites/airl-workshop.caddy
 	handle @backend {
 		reverse_proxy 127.0.0.1:$PORT
 	}
+EOF
+  if [ -n "$PAGE_URL" ]; then
+    cat <<EOF
+	handle {
+		redir ${PAGE_URL}?{query} 301
+	}
+EOF
+  else
+    cat <<EOF
 	handle {
 		root * $BASE/site
 		@assets path /assets/*
@@ -1857,6 +1949,9 @@ SITE_CADDY=/etc/caddy/sites/airl-workshop.caddy
 		header @page Cache-Control "no-cache"
 		file_server
 	}
+EOF
+  fi
+  cat <<EOF
 	handle_errors {
 		@notfound expression {err.status_code} == 404
 		handle @notfound {
@@ -1938,11 +2033,15 @@ else
 fi
 PAGE_OK=0
 for _ in $(seq 1 30); do
-  if "${CURL[@]}" "$URL/" 2>/dev/null | grep -q '<title>'; then PAGE_OK=1; break; fi
+  if [ -n "$PAGE_URL" ]; then
+    LOC="$("${CURL[@]}" -o /dev/null -w '%{redirect_url}' "$URL/?utm_source=selftest" 2>/dev/null || true)"
+    if [ "$LOC" = "${PAGE_URL}?utm_source=selftest" ]; then PAGE_OK=1; break; fi
+  elif "${CURL[@]}" "$URL/" 2>/dev/null | grep -q '<title>'; then PAGE_OK=1; break; fi
   sleep 3
 done
 if [ "$PAGE_OK" = 1 ]; then
-  ok "Page opens at $BASE_URL"
+  if [ -n "$PAGE_URL" ]; then ok "$BASE_URL sends visitors to $PAGE_URL (with their utm tags)"
+  else ok "Page opens at $BASE_URL"; fi
   if "${CURL[@]}" -X POST -H 'Content-Type: application/x-www-form-urlencoded;charset=UTF-8' \
        --data "$TEST_BODY" "$URL/api/lead" 2>/dev/null | grep -q '"ok": true'; then
     ok "Form endpoint answers (test request, nothing saved)"
@@ -1973,6 +2072,7 @@ if [ -n "$TG_TOKEN" ] && [ -n "$TG_CHAT" ]; then TG_STATE="on (channel $TG_CHAT)
 echo "  Telegram:        $TG_STATE"
 if [ -n "$WA_NUM" ]; then WA_STATE="after the form the page opens WhatsApp chat with +$WA_NUM"; else WA_STATE="off"; fi
 echo "  WhatsApp:        $WA_STATE"
+if [ -n "$PAGE_URL" ]; then echo "  Page:            $PAGE_URL (this server redirects there)"; fi
 echo "  Database:        $BASE/data/leads.db, daily backups in $BASE/backups"
 echo "  Logs:            journalctl -u airl-workshop -f"
 echo "  Commands:        airl-workshop stats | backup | telegram-test | import old-leads.csv"

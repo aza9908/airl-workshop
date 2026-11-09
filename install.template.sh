@@ -20,6 +20,9 @@
 #   --no-whatsapp     turn that WhatsApp step off
 #   --telegram        connect a Telegram channel for leads (asks for the bot token here)
 #   --no-telegram     stop posting leads to Telegram
+#   --page-url URL    the page itself lives elsewhere (e.g. https://airl.kz/ai-for-work/workshop/):
+#                     visitors of this server are sent there; /api and /admin keep working here
+#   --serve-page      serve the page from this server again (undo --page-url)
 #
 # Safe to run again: leads, admin password and settings are kept.
 set -Eeuo pipefail
@@ -34,6 +37,7 @@ FROM_DIR=""
 REFRESH=0
 FORWARD_FLAG=""
 WA_FLAG=""
+PAGE_FLAG=""
 TG_FLAG=""
 
 ok()   { printf '\033[32m✓\033[0m %s\n' "$*"; }
@@ -56,7 +60,9 @@ while [ $# -gt 0 ]; do
     --no-whatsapp)  WA_FLAG="off"; shift ;;
     --telegram)     TG_FLAG=setup; shift ;;
     --no-telegram)  TG_FLAG=off; shift ;;
-    -h|--help)      sed -n '2,26p' "$0"; exit 0 ;;
+    --page-url)     need_value "$1" "${2:-}"; PAGE_FLAG="$2"; shift 2 ;;
+    --serve-page)   PAGE_FLAG=off; shift ;;
+    -h|--help)      sed -n '2,29p' "$0"; exit 0 ;;
     *)              die "Unknown option: $1 (see --help)" ;;
   esac
 done
@@ -194,6 +200,14 @@ chmod -R a+rX "$BASE/site.new"
 swap_dir "$BASE/site.new" "$BASE/site"
 ok "Form now sends leads to $BASE_URL/api/lead"
 if [ -n "$WA_NUM" ]; then ok "After the form, the page opens WhatsApp chat with +$WA_NUM"; fi
+if [ "$PAGE_FLAG" = off ]; then PAGE_URL=""
+elif [ -n "$PAGE_FLAG" ]; then PAGE_URL="$PAGE_FLAG"
+else PAGE_URL="$(get_env SITE_PAGE_URL)"; fi
+if [ -n "$PAGE_URL" ]; then
+  printf '%s' "$PAGE_URL" | grep -Eq '^https?://[A-Za-z0-9.-]+(/[A-Za-z0-9._~/-]*)?$' || die "Not a valid page address: $PAGE_URL"
+  case "$PAGE_URL" in */) ;; *) PAGE_URL="$PAGE_URL/" ;; esac
+  ok "Visitors of this server will be sent to $PAGE_URL (form and admin stay here)"
+fi
 
 # ------------------------------------------------------------ Telegram ----
 TG_TOKEN="$(get_env TELEGRAM_BOT_TOKEN)"
@@ -233,7 +247,7 @@ ADMIN_USER="$(get_env ADMIN_USER)"; ADMIN_USER="${ADMIN_USER:-admin}"
 FWD_ENABLED="${FORWARD_FLAG:-$(get_env FORWARD_ENABLED)}"; FWD_ENABLED="${FWD_ENABLED:-1}"
 OTHER_LINES=""
 if [ -f "$ENV_FILE" ]; then
-  OTHER_LINES="$(grep -vE '^(#|$|ADMIN_USER=|ADMIN_PASSWORD=|FORWARD_URL=|FORWARD_ENABLED=|SITE_DOMAIN=|SITE_WHATSAPP=|TELEGRAM_BOT_TOKEN=|TELEGRAM_CHAT_ID=|HOST=|PORT=|DATA_DIR=|BACKUP_DIR=)' "$ENV_FILE" || true)"
+  OTHER_LINES="$(grep -vE '^(#|$|ADMIN_USER=|ADMIN_PASSWORD=|FORWARD_URL=|FORWARD_ENABLED=|SITE_DOMAIN=|SITE_WHATSAPP=|SITE_PAGE_URL=|TELEGRAM_BOT_TOKEN=|TELEGRAM_CHAT_ID=|HOST=|PORT=|DATA_DIR=|BACKUP_DIR=)' "$ENV_FILE" || true)"
 fi
 umask 077
 cat > "$ENV_FILE" <<EOF
@@ -249,6 +263,8 @@ TELEGRAM_CHAT_ID=$TG_CHAT
 # Page settings
 SITE_DOMAIN=$DOMAIN
 SITE_WHATSAPP=$WA_NUM
+# Where the page itself lives; empty = served by this server
+SITE_PAGE_URL=$PAGE_URL
 HOST=127.0.0.1
 PORT=$PORT
 DATA_DIR=$BASE/data
@@ -362,6 +378,13 @@ nginx_site_body() {
         proxy_set_header X-Forwarded-For \$remote_addr;
         proxy_set_header X-Forwarded-Proto \$scheme;
     }
+EOF
+  if [ -n "$PAGE_URL" ]; then
+    cat <<EOF
+    location / { return 301 $PAGE_URL\$is_args\$args; }
+EOF
+  else
+    cat <<EOF
     location /assets/ {
         $HDRS
         add_header Cache-Control "public, max-age=31536000, immutable" always;
@@ -376,6 +399,7 @@ nginx_site_body() {
     error_page 404 /404.html;
     location = /404.html { internal; }
 EOF
+  fi
 }
 
 nginx_listen() {  # nginx_listen PORT [ssl]
@@ -547,6 +571,15 @@ SITE_CADDY=/etc/caddy/sites/airl-workshop.caddy
 	handle @backend {
 		reverse_proxy 127.0.0.1:$PORT
 	}
+EOF
+  if [ -n "$PAGE_URL" ]; then
+    cat <<EOF
+	handle {
+		redir ${PAGE_URL}?{query} 301
+	}
+EOF
+  else
+    cat <<EOF
 	handle {
 		root * $BASE/site
 		@assets path /assets/*
@@ -555,6 +588,9 @@ SITE_CADDY=/etc/caddy/sites/airl-workshop.caddy
 		header @page Cache-Control "no-cache"
 		file_server
 	}
+EOF
+  fi
+  cat <<EOF
 	handle_errors {
 		@notfound expression {err.status_code} == 404
 		handle @notfound {
@@ -636,11 +672,15 @@ else
 fi
 PAGE_OK=0
 for _ in $(seq 1 30); do
-  if "${CURL[@]}" "$URL/" 2>/dev/null | grep -q '<title>'; then PAGE_OK=1; break; fi
+  if [ -n "$PAGE_URL" ]; then
+    LOC="$("${CURL[@]}" -o /dev/null -w '%{redirect_url}' "$URL/?utm_source=selftest" 2>/dev/null || true)"
+    if [ "$LOC" = "${PAGE_URL}?utm_source=selftest" ]; then PAGE_OK=1; break; fi
+  elif "${CURL[@]}" "$URL/" 2>/dev/null | grep -q '<title>'; then PAGE_OK=1; break; fi
   sleep 3
 done
 if [ "$PAGE_OK" = 1 ]; then
-  ok "Page opens at $BASE_URL"
+  if [ -n "$PAGE_URL" ]; then ok "$BASE_URL sends visitors to $PAGE_URL (with their utm tags)"
+  else ok "Page opens at $BASE_URL"; fi
   if "${CURL[@]}" -X POST -H 'Content-Type: application/x-www-form-urlencoded;charset=UTF-8' \
        --data "$TEST_BODY" "$URL/api/lead" 2>/dev/null | grep -q '"ok": true'; then
     ok "Form endpoint answers (test request, nothing saved)"
@@ -671,6 +711,7 @@ if [ -n "$TG_TOKEN" ] && [ -n "$TG_CHAT" ]; then TG_STATE="on (channel $TG_CHAT)
 echo "  Telegram:        $TG_STATE"
 if [ -n "$WA_NUM" ]; then WA_STATE="after the form the page opens WhatsApp chat with +$WA_NUM"; else WA_STATE="off"; fi
 echo "  WhatsApp:        $WA_STATE"
+if [ -n "$PAGE_URL" ]; then echo "  Page:            $PAGE_URL (this server redirects there)"; fi
 echo "  Database:        $BASE/data/leads.db, daily backups in $BASE/backups"
 echo "  Logs:            journalctl -u airl-workshop -f"
 echo "  Commands:        airl-workshop stats | backup | telegram-test | import old-leads.csv"
