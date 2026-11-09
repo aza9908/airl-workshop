@@ -16,3 +16,12 @@
     src="https://www.facebook.com/tr?id=1677800013871546&ev=PageView&noscript=1"
     /></noscript>
     <!-- End Meta Pixel Code -->
+    <script>
+      /* airl.kz/ai-for-work/workshop/#register: сразу открыть форму заявки
+         (сюда ведут кнопки «Регистрация» со страницы курса AI for Work) */
+      addEventListener('load', function () {
+        if (location.hash !== '#register') return;
+        var b = document.querySelector('[data-open-form]');
+        if (b) b.click();
+      });
+    </script>
