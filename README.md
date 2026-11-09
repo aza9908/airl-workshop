@@ -17,8 +17,9 @@
 | Путь | Что это |
 |---|---|
 | `site/` | Готовая сборка страницы: HTML, JS, CSS, картинки, шрифты. Копируется с airl-workshop.web.app GitHub Action'ом (см. ниже). |
-| `hq/` | Фото в высоком разрешении (оригиналы с airl.kz, то же кадрирование). При сборке подменяют файлы из `site/` с тем же именем. |
-| `build-airl.sh` | Собирает страницу для airl.kz в `dist/airl/`: пути под `/ai-for-work/workshop/`, форма на server.airl.kz, WhatsApp, фото из `hq/`. |
+| `hq/` | Фото в высоком разрешении: вырезаны из оригиналов с телефона с тем же кадрированием, без фильтров и без GPS. При сборке подменяют файлы из `site/` с тем же именем. |
+| `airl-head.html` | Теги, которые есть только в версии для airl.kz (Meta Pixel). Сборка вставляет их в конец `<head>`. |
+| `build-airl.sh` | Собирает страницу для airl.kz в `dist/airl/`: пути под `/ai-for-work/workshop/`, форма на server.airl.kz, WhatsApp, фото из `hq/`, теги из `airl-head.html`. |
 | `app/app.py` | Бэкенд заявок. Python 3.8+, без сторонних библиотек. |
 | `app/sitetool.py` | Копирует страницу и готовит её к публикации: адрес формы, номер WhatsApp, подпапка, фото из `hq/`. |
 | `install.template.sh` + `build.py` | Исходник скрипта установки. `python3 build.py` собирает из них и `app/*.py` один файл `install.sh`. |
@@ -44,7 +45,9 @@
 ## Как обновить страницу на airl.kz
 
 1. При необходимости заменить фото в `hq/assets/` (имя файла как в `site/assets/`) или скачать
-   свежую страницу с Firebase (Actions → «Copy live page into site/»).
+   свежую страницу с Firebase (Actions → «Copy live page into site/»). Если кто-то правил
+   `ai-for-work/workshop/index.html` прямо в `landing` (например, добавил счётчик), сначала
+   перенести эту правку сюда (в `airl-head.html`), иначе следующая сборка её затрёт.
 2. `./build-airl.sh`
 3. Скопировать `dist/airl/` в репозиторий `aza9908/landing` как `ai-for-work/workshop/`
    (старую папку заменить целиком), закоммитить и запушить в `main`. Firebase App Hosting
